@@ -1,9 +1,12 @@
+// Usage: npm run start -- encrypt --chunk-size <chunk_size_in_bytes> <file1> <file2> ...
+
 import fs from "fs";
 import path from "path";
 import secp256k1 from "secp256k1";
 import keccak256 from "keccak256";
 import { encrypt } from "eciesjs";
 import { eth_getEncryptionPublicKey, eth_decrypt } from "eip-5630";
+import { readChunk } from "read-chunk";
 
 import readlineSync from "readline-sync";
 
@@ -11,12 +14,13 @@ enum State {
   None,
   Encrypting,
   Decrypting,
+  ChoosingChunkSize,
 }
 
 function showAvailableCommands() {
   console.log("Available commands:");
-  console.log("    encrypt <file>");
-  console.log("    decrypt <file>");
+  console.log("    encrypt [--chunk-size <size_in_bytes>] <file1> <file2> ...");
+  console.log("    decrypt [--chunk-size <size_in_bytes>] <file1> <file2> ...");
 }
 
 function isValidPrivateKey(privateKey: string) {
@@ -24,10 +28,6 @@ function isValidPrivateKey(privateKey: string) {
     privateKey.length === 64 &&
     secp256k1.privateKeyVerify(Buffer.from(privateKey, "hex"))
   );
-}
-
-function isAnswered(confirmation: string): boolean {
-  return confirmation === "y" || confirmation === "n" || confirmation === "";
 }
 
 function publicKeyToAddress(publicKey: Uint8Array): string {
@@ -41,12 +41,30 @@ function publicKeyToAddress(publicKey: Uint8Array): string {
   return address;
 }
 
+async function appendBuffersToStream(
+  stream: fs.WriteStream,
+  encryptedBuffer: Buffer
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    stream.write(encryptedBuffer, (error) => {
+      if (error !== undefined && error !== null) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
 if (process.argv.length < 3) {
   showAvailableCommands();
   process.exit(0);
 }
 
+let chunkSize = 0;
+
 const files = [];
+let prevState = State.None;
 let state = State.None;
 for (const arg of process.argv.slice(2)) {
   switch (state) {
@@ -62,21 +80,43 @@ for (const arg of process.argv.slice(2)) {
       }
       break;
     case State.Decrypting:
-      if (!arg.endsWith(".eip5630")) {
-        console.error(
-          `"${arg}" is not a valid encrypted file. Encrypted files must end ` +
-            `with the ".eip5630" extension.`
-        );
-        process.exit(1);
+      if (arg == "--chunk-size") {
+        prevState = state;
+        state = State.ChoosingChunkSize;
+      } else {
+        if (!arg.endsWith(".eip5630")) {
+          console.error(
+            `"${arg}" is not a valid encrypted file. Encrypted files must ` +
+              `end with the ".eip5630" extension.`
+          );
+          process.exit(1);
+        }
+
+        const fullFilePath = path.resolve(arg);
+        if (!fs.existsSync(fullFilePath)) {
+          console.error(`"${arg}" is not a valid file path.`);
+          process.exit(1);
+        }
+        files.push(fullFilePath);
+      }
+      break;
+    case State.Encrypting:
+      if (arg == "--chunk-size") {
+        prevState = state;
+        state = State.ChoosingChunkSize;
+      } else {
+        const fullFilePath = path.resolve(arg);
+        if (!fs.existsSync(fullFilePath)) {
+          console.error(`"${arg}" is not a valid file path.`);
+          process.exit(1);
+        }
+        files.push(fullFilePath);
       }
 
-    case State.Encrypting:
-      const fullFilePath = path.resolve(arg);
-      if (!fs.existsSync(fullFilePath)) {
-        console.error(`"${arg}" is not a valid file path.`);
-        process.exit(1);
-      }
-      files.push(fullFilePath);
+      break;
+    case State.ChoosingChunkSize:
+      chunkSize = Number(arg);
+      state = prevState;
       break;
   }
 }
@@ -106,28 +146,82 @@ const publicKey = secp256k1.publicKeyCreate(
 
 const address = publicKeyToAddress(publicKey);
 
-for (const filePath of files) {
+async function readStreamsByChunks(
+  filePath: string,
+  chunkSize: number,
+  processorKey: string,
+  postProcessor: (encryptionKey: string, inputBuffer: Buffer) => Buffer
+): Promise<Buffer[]> {
+  const stream = fs.createReadStream(filePath);
+
+  const encryptedBuffers: Buffer[] = [];
+
+  const fileInfo = fs.statSync(filePath);
+  const numChunks = fileInfo.size / chunkSize;
+  console.log(`numChunks: ${numChunks}`);
+
+  for (let i = 0; i < numChunks; ++i) {
+    console.log(`reading chunk ${i}...`);
+    const currentBuffer = await readChunk(filePath, {
+      length: chunkSize,
+      startPosition: chunkSize * i,
+    });
+
+    const encryptedBuffer = postProcessor(processorKey, currentBuffer);
+    encryptedBuffers.push(encryptedBuffer);
+  }
+
+  return encryptedBuffers;
+}
+
+files.forEach(async (filePath) => {
+  const currentChunkSize = chunkSize == 0 ? 2e9 : chunkSize;
+
   switch (state) {
     case State.Encrypting:
       {
         console.log(`Encrypting all files for ${address}:`);
-        const encryptedFilePath = filePath + ".eip5630";
+
+        const encryptedFilePath =
+          filePath + "." + currentChunkSize + ".eip5630";
         console.log(`    ${filePath} -> ${encryptedFilePath}`);
-        const file = fs.readFileSync(filePath);
+
         const encryptionKey = eth_getEncryptionPublicKey(privateKey);
-        const encryptedFile = encrypt(encryptionKey, file);
-        fs.writeFileSync(encryptedFilePath, encryptedFile);
+
+        const encryptedBuffers = await readStreamsByChunks(
+          filePath,
+          currentChunkSize,
+          encryptionKey,
+          encrypt
+        );
+
+        const encryptedStream = fs.createWriteStream(encryptedFilePath);
+        encryptedBuffers.forEach(async (encryptedBuffer) => {
+          await appendBuffersToStream(encryptedStream, encryptedBuffer);
+        });
       }
       break;
     case State.Decrypting:
       {
         console.log(`Decrypting all files for ${address}:`);
-        const decryptedFilePath = filePath.split(".").slice(0, -1).join(".");
+        const decryptedFilePath = filePath.split(".").slice(0, -2).join(".");
         console.log(`    ${filePath} -> ${decryptedFilePath}`);
-        const file = fs.readFileSync(filePath);
-        const decryptedFile = eth_decrypt(privateKey, file);
-        fs.writeFileSync(decryptedFilePath, decryptedFile);
+
+        // The cypher seems to append 97 bytes per chunk
+        const cipherLen = currentChunkSize + 97;
+
+        const decryptedBuffers = await readStreamsByChunks(
+          filePath,
+          cipherLen,
+          privateKey,
+          eth_decrypt
+        );
+
+        const decryptedStream = fs.createWriteStream(decryptedFilePath);
+        decryptedBuffers.forEach(async (decryptedBuffer) => {
+          await appendBuffersToStream(decryptedStream, decryptedBuffer);
+        });
       }
       break;
   }
-}
+});

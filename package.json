@@ -10,12 +10,13 @@
     "format": "prettier --write .",
     "compile": "npx tsc",
     "start:cli": "node dist/cli.js",
-    "start": "npm-run-all compile \"start:cli -- {@}\" --"
+    "start": "NODE_ENV=$npm_config_chunk-size npm-run-all compile \"start:cli -- {@}\" --"
   },
   "dependencies": {
     "eciesjs": "0.3.15",
     "eip-5630": "1.1.0",
     "keccak256": "1.0.6",
+    "read-chunk": "^4.0.3",
     "readline-sync": "1.4.10",
     "secp256k1": "4.0.3"
   },
